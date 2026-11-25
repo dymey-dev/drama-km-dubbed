@@ -1,0 +1,84 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Audio, Video & Stem Media Artifacts (Heavy Files)
+*.mp4
+*.mkv
+*.avi
+*.mov
+*.webm
+*.wav
+*.mp3
+*.flac
+*.aac
+*.ogg
+
+# Studio Cache & Generated Directories (Keep folder structures via .gitkeep)
+completed/*
+!completed/.gitkeep
+
+master_speech/*
+!master_speech/.gitkeep
+
+stems/*
+!stems/.gitkeep
+
+studio_cache/*
+!studio_cache/.gitkeep
+
+uploads/*
+!uploads/.gitkeep
+
+subtitles/*
+!subtitles/.gitkeep
+
+# Logs & Temporary files
+*.log
+*.tmp
+temp_*
+
+# IDEs & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating System Files
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
