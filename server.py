@@ -13,8 +13,11 @@ import json
 import time
 import shutil
 import asyncio
+import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+
+logger = logging.getLogger("studio_server")
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
@@ -491,10 +494,37 @@ async def audition_line(req: AuditionRequest):
     pitch = req.pitch or "-2Hz"
     rate = req.rate or "+0%"
 
-    out_mp3 = TEMP_WORK_DIR / f"audition_{req.line_idx}.mp3"
-    await safe_communicate_tts(text, voice, rate, pitch, "+0%", out_mp3)
+    import hashlib
+    sig = f"{req.line_idx}_{text}_{voice}_{pitch}_{rate}"
+    sig_hash = hashlib.md5(sig.encode("utf-8")).hexdigest()[:8]
+    out_mp3 = TEMP_WORK_DIR / f"audition_{req.line_idx}_{sig_hash}.mp3"
 
-    return {"status": "success", "audio_url": f"/media/audition?idx={req.line_idx}&t={time.time()}"}
+    # Clean previous audition files for this line index to save disk space
+    for old_file in TEMP_WORK_DIR.glob(f"audition_{req.line_idx}*.mp3"):
+        if old_file != out_mp3:
+            try:
+                old_file.unlink()
+            except Exception:
+                pass
+
+    # Always generate fresh audio when auditioning an edited line
+    await safe_communicate_tts(text, voice, rate, pitch, "+0%", out_mp3, force=True)
+
+    # Sync edited line with server-side subtitle state
+    if STUDIO_STATE.get("subtitle_data"):
+        for sub in STUDIO_STATE["subtitle_data"]:
+            if sub.get("idx") == req.line_idx:
+                sub["khmer_text"] = text
+                sub["text"] = text
+                sub["voice"] = voice
+                sub["pitch"] = pitch
+                sub["rate"] = rate
+                break
+
+    return {
+        "status": "success",
+        "audio_url": f"/media/audition?idx={req.line_idx}&sig={sig_hash}&t={time.time()}"
+    }
 
 @app.post("/api/separate_stems")
 def separate_stems_endpoint():
@@ -562,70 +592,76 @@ async def run_pipeline_endpoint(req: PipelineRequest):
     STUDIO_STATE["is_processing"] = True
     STUDIO_STATE["progress_status"] = "Starting Pipeline..."
 
-    # 1. Stems (Ensure stem belongs to current video)
-    bgm_path = STUDIO_STATE.get("stem_bgm")
-    needs_demucs = False
-    if not bgm_path or not Path(bgm_path).exists():
-        needs_demucs = True
-    else:
-        # Check stem ownership
-        m = re.search(r'(?:ep|ep_)?(\d+)', vid_path.name, re.IGNORECASE)
-        ep_sig = f"ep_{int(m.group(1)):02d}" if m else vid_path.stem.lower()
-        if ep_sig not in str(bgm_path).lower() and vid_path.stem not in str(bgm_path):
+    try:
+        # 1. Stems (Ensure stem belongs to current video)
+        bgm_path = STUDIO_STATE.get("stem_bgm")
+        needs_demucs = False
+        if not bgm_path or not Path(bgm_path).exists():
             needs_demucs = True
+        else:
+            # Check stem ownership
+            m = re.search(r'(?:ep|ep_)?(\d+)', vid_path.name, re.IGNORECASE)
+            ep_sig = f"ep_{int(m.group(1)):02d}" if m else vid_path.stem.lower()
+            if ep_sig not in str(bgm_path).lower() and vid_path.stem not in str(bgm_path):
+                needs_demucs = True
 
-    if needs_demucs:
-        STUDIO_STATE["progress_status"] = "Separating Stems with Demucs..."
-        vocals, no_vocals = separate_stems_demucs(vid_path, WORKSPACE_DIR)
-        STUDIO_STATE["stem_vocals"] = vocals
-        STUDIO_STATE["stem_bgm"] = no_vocals
-        bgm_path = no_vocals
+        if needs_demucs:
+            STUDIO_STATE["progress_status"] = "Separating Stems with Demucs..."
+            vocals, no_vocals = separate_stems_demucs(vid_path, WORKSPACE_DIR)
+            STUDIO_STATE["stem_vocals"] = vocals
+            STUDIO_STATE["stem_bgm"] = no_vocals
+            bgm_path = no_vocals
 
-    # 2. Synthesis
-    STUDIO_STATE["progress_status"] = "Synthesizing Khmer dialogue lines..."
-    synth_temp = TEMP_WORK_DIR / vid_path.stem
-    items = req.lines or STUDIO_STATE["subtitle_data"]
-    STUDIO_STATE["subtitle_data"] = items
+        # 2. Synthesis
+        STUDIO_STATE["progress_status"] = "Synthesizing Khmer dialogue lines..."
+        synth_temp = TEMP_WORK_DIR / vid_path.stem
+        items = req.lines or STUDIO_STATE["subtitle_data"]
+        STUDIO_STATE["subtitle_data"] = items
 
-    dub_items = await synthesize_dialogue_timeline(
-        items=items,
-        character_map=req.characters,
-        temp_dir=synth_temp
-    )
+        dub_items = await synthesize_dialogue_timeline(
+            items=items,
+            character_map=req.characters,
+            temp_dir=synth_temp
+        )
 
-    # 3. Assemble speech master
-    STUDIO_STATE["progress_status"] = "Assembling sample-accurate master speech track..."
-    total_dur = get_duration(vid_path)
-    speech_master = MASTER_SPEECH_DIR / f"{vid_path.stem}_master_speech.wav"
-    assemble_master_speech_buffer(dub_items, total_dur, speech_master)
-    STUDIO_STATE["master_speech_wav"] = speech_master
+        # 3. Assemble speech master
+        STUDIO_STATE["progress_status"] = "Assembling sample-accurate master speech track..."
+        total_dur = get_duration(vid_path)
+        speech_master = MASTER_SPEECH_DIR / f"{vid_path.stem}_master_speech.wav"
+        assemble_master_speech_buffer(dub_items, total_dur, speech_master)
+        STUDIO_STATE["master_speech_wav"] = speech_master
 
-    # 4. Mix & Mux
-    STUDIO_STATE["progress_status"] = "Mastering audio with sidechain ducking & muxing video..."
-    out_vid = COMPLETED_DIR / f"{vid_path.stem}_Khmer_Dubbed.mp4"
+        # 4. Mix & Mux
+        STUDIO_STATE["progress_status"] = "Mastering audio with sidechain ducking & muxing video..."
+        out_vid = COMPLETED_DIR / f"{vid_path.stem}_Khmer_Dubbed.mp4"
 
-    mix_stems_and_mux_video(
-        video_in=vid_path,
-        bgm_wav=bgm_path,
-        speech_wav=speech_master,
-        video_out=out_vid,
-        voice_boost=req.voice_boost,
-        bgm_volume=req.bgm_volume,
-        duck_ratio=req.duck_ratio,
-        duck_attack=req.duck_attack,
-        duck_release=req.duck_release,
-        limiter_peak=req.limiter_peak
-    )
+        mix_stems_and_mux_video(
+            video_in=vid_path,
+            bgm_wav=bgm_path,
+            speech_wav=speech_master,
+            video_out=out_vid,
+            voice_boost=req.voice_boost,
+            bgm_volume=req.bgm_volume,
+            duck_ratio=req.duck_ratio,
+            duck_attack=req.duck_attack,
+            duck_release=req.duck_release,
+            limiter_peak=req.limiter_peak
+        )
 
-    STUDIO_STATE["dubbed_video_path"] = out_vid
-    STUDIO_STATE["is_processing"] = False
-    STUDIO_STATE["progress_status"] = "Dubbing Complete!"
+        STUDIO_STATE["dubbed_video_path"] = out_vid
+        STUDIO_STATE["progress_status"] = "Dubbing Complete!"
 
-    return {
-        "status": "success",
-        "dubbed_url": f"/media/dubbed_video?t={time.time()}",
-        "speech_wav_url": f"/media/speech_wav?t={time.time()}"
-    }
+        return {
+            "status": "success",
+            "dubbed_url": f"/media/dubbed_video?t={time.time()}",
+            "speech_wav_url": f"/media/speech_wav?t={time.time()}"
+        }
+    except Exception as e:
+        logger.exception("Pipeline run encountered an error")
+        STUDIO_STATE["progress_status"] = f"Pipeline Error: {e}"
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        STUDIO_STATE["is_processing"] = False
 
 # ----------------- Media Streaming Endpoints -----------------
 
@@ -664,11 +700,21 @@ def get_speech_audio():
     return FileResponse(str(p), media_type="audio/wav", headers=NO_CACHE_HEADERS)
 
 @app.get("/media/audition")
-def get_audition_audio(idx: int):
-    p = TEMP_WORK_DIR / f"audition_{idx}.mp3"
-    if not p.exists():
+def get_audition_audio(idx: int, sig: Optional[str] = None):
+    p = None
+    if sig:
+        target = TEMP_WORK_DIR / f"audition_{idx}_{sig}.mp3"
+        if target.exists():
+            p = target
+
+    if not p:
+        matches = sorted(TEMP_WORK_DIR.glob(f"audition_{idx}*.mp3"), key=lambda x: x.stat().st_mtime, reverse=True)
+        if matches:
+            p = matches[0]
+
+    if not p or not p.exists():
         raise HTTPException(status_code=404, detail="Audition file not found")
-    return FileResponse(str(p), media_type="audio/mpeg")
+    return FileResponse(str(p), media_type="audio/mpeg", headers=NO_CACHE_HEADERS)
 
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 

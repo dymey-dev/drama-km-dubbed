@@ -580,17 +580,18 @@
                                 <option value="Mother" ${spk === 'Mother' ? 'selected' : ''}>👩 Mother</option>
                                 <option value="Child" ${spk === 'Child' ? 'selected' : ''}>🧒 Child</option>
                             </select>
-                            <button onclick="auditionCard(${item.idx}, ${i})" class="btn btn-xs btn-outline border-slate-700 text-sky-400 hover:bg-sky-500/10 gap-1 text-[11px]">
-                                <i data-lucide="play" class="w-3 h-3 fill-current"></i> Audition
+                            <button id="btn-audition-${item.idx}" onclick="auditionCard(${item.idx}, ${i})" class="btn btn-xs btn-outline border-slate-700 text-sky-400 hover:bg-sky-500/10 gap-1 text-[11px] transition-all" title="Audition this line (or press Ctrl+Enter in text area)">
+                                <i data-lucide="play" class="w-3 h-3 fill-current"></i> <span>Audition</span>
                             </button>
                         </div>
                     </div>
 
                     <!-- Khmer Text Area -->
                     <div>
-                        <textarea oninput="updateKhmerText(${i}, this.value)" onchange="updateKhmerText(${i}, this.value)" 
-                            class="textarea textarea-bordered w-full bg-[#080c14] border-slate-700/80 text-white khmer-font text-sm leading-relaxed p-2.5 focus:border-indigo-500 min-h-[58px]"
-                            placeholder="Enter Khmer translation...">${item.text || item.khmer_text || ''}</textarea>
+                        <textarea id="textarea-line-${item.idx}" oninput="updateKhmerText(${i}, this.value, ${item.idx})" onchange="updateKhmerText(${i}, this.value, ${item.idx})" 
+                            onkeydown="if((event.ctrlKey||event.metaKey)&&event.key==='Enter'){event.preventDefault();auditionCard(${item.idx},${i});}"
+                            class="textarea textarea-bordered w-full bg-[#080c14] border-slate-700/80 text-white khmer-font text-sm leading-relaxed p-2.5 focus:border-indigo-500 min-h-[58px] transition-all"
+                            placeholder="Enter Khmer translation... (Ctrl+Enter to audition)">${item.text || item.khmer_text || ''}</textarea>
                     </div>
 
                     ${item.english_text ? `
@@ -617,15 +618,39 @@
                 badgeEl.innerHTML = `<i data-lucide="${meta.icon}" class="w-2.5 h-2.5"></i> ${meta.label}`;
                 lucide.createIcons();
             }
+
+            // Highlight audition button to indicate new voice ready to re-audition
+            const btn = document.getElementById(`btn-audition-${lineIdx}`);
+            if (btn) {
+                btn.classList.add('border-sky-500', 'text-sky-300');
+                btn.querySelector('span').textContent = 'Re-audition';
+            }
         };
 
-        window.updateKhmerText = function(index, val) {
+        window.updateKhmerText = function(index, val, lineIdx) {
             currentSubtitles[index].text = val;
             currentSubtitles[index].khmer_text = val;
+
+            if (lineIdx !== undefined) {
+                const btn = document.getElementById(`btn-audition-${lineIdx}`);
+                if (btn) {
+                    btn.classList.add('border-sky-500', 'text-sky-300');
+                    btn.querySelector('span').textContent = 'Re-audition';
+                }
+            }
         };
+
+        let currentAuditionBtn = null;
 
         // Audition Line
         window.auditionCard = async function(lineIdx, index) {
+            const textarea = document.getElementById(`textarea-line-${lineIdx}`);
+            if (textarea) {
+                const liveVal = textarea.value.trim();
+                currentSubtitles[index].text = liveVal;
+                currentSubtitles[index].khmer_text = liveVal;
+            }
+
             const item = currentSubtitles[index];
             const text = item.text || item.khmer_text;
             if (!text) {
@@ -637,6 +662,28 @@
             const voice = item.voice || meta.voice;
             const pitch = item.pitch || meta.pitch;
             const rate = item.rate || meta.rate;
+
+            const btn = document.getElementById(`btn-audition-${lineIdx}`);
+            const resetBtn = () => {
+                if (btn) {
+                    btn.disabled = false;
+                    btn.innerHTML = `<i data-lucide="play" class="w-3 h-3 fill-current"></i> <span>Re-audition</span>`;
+                    lucide.createIcons();
+                }
+            };
+
+            // If this card is already playing, pause it on second click
+            if (currentAuditionBtn === btn && !auditionPlayer.paused) {
+                auditionPlayer.pause();
+                resetBtn();
+                currentAuditionBtn = null;
+                return;
+            }
+
+            if (btn) {
+                btn.disabled = true;
+                btn.innerHTML = `<span class="loading loading-spinner loading-xs text-sky-400"></span> <span>Voicing...</span>`;
+            }
 
             headerStatus.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-ping"></span> Auditioning #${lineIdx}...`;
 
@@ -655,11 +702,35 @@
                 const data = await res.json();
                 if (data.status === 'success') {
                     auditionPlayer.src = data.audio_url;
-                    auditionPlayer.play();
+                    currentAuditionBtn = btn;
+
+                    auditionPlayer.onplay = () => {
+                        if (btn) {
+                            btn.disabled = false;
+                            btn.innerHTML = `<i data-lucide="volume-2" class="w-3 h-3 text-emerald-400 animate-pulse"></i> <span>Playing...</span>`;
+                            lucide.createIcons();
+                        }
+                    };
+
+                    auditionPlayer.onended = () => {
+                        resetBtn();
+                        currentAuditionBtn = null;
+                    };
+
+                    auditionPlayer.onerror = () => {
+                        resetBtn();
+                        currentAuditionBtn = null;
+                    };
+
+                    await auditionPlayer.play();
                     headerStatus.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-emerald-500"></span> Ready';
+                } else {
+                    resetBtn();
+                    showToast('Audition failed: ' + (data.detail || 'unknown error'), true);
                 }
             } catch (err) {
                 console.error(err);
+                resetBtn();
                 showToast('Audition failed', true);
             }
         };

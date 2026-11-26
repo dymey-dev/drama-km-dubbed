@@ -13,10 +13,14 @@ import json
 import time
 import wave
 import asyncio
+import logging
 import subprocess
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple, Callable
 import numpy as np
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("studio_core")
 
 # Supported Edge-TTS Khmer Voices
 KHMER_VOICES = {
@@ -339,14 +343,18 @@ def get_media_info(file_path: Path) -> Dict[str, Any]:
     return json.loads(res.stdout)
 
 def get_duration(file_path: Path) -> float:
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
-        str(file_path)
-    ]
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    return float(res.stdout.strip())
+    try:
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            str(file_path)
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        val = res.stdout.strip()
+        return float(val) if val else 0.0
+    except Exception:
+        return 0.0
 
 def parse_srt(path: Path) -> List[Dict[str, Any]]:
     if not path.exists():
@@ -448,34 +456,107 @@ def separate_stems_demucs(video_or_audio: Path, output_base_dir: Path, progress_
         progress_cb("Stem separation complete.")
     return vocals, no_vocals
 
-async def safe_communicate_tts(text: str, voice: str, rate: str, pitch: str, volume: str, out_path: Path):
+def clean_tts_text(text: str) -> str:
+    if not text:
+        return ""
+    # Strip zero-width, byte-order-mark, and invisible unicode characters
+    cleaned = re.sub(r'[\u200b\u200c\u200d\u200e\u200f\ufeff\u00a0\u3000]', ' ', text)
+    # Strip standalone role bracket labels if any slipped into the text
+    cleaned = re.sub(r'\[(?:Male|Female|Male Lead|Female Lead|Narrator|Boy|Girl|Supporting Male|Supporting Female)[^\]]*\]:?', '', cleaned, flags=re.IGNORECASE)
+    # Strip HTML tags
+    cleaned = re.sub(r'<[^>]+>', '', cleaned)
+    # Normalize whitespaces
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    return cleaned
+
+async def safe_communicate_tts(text: str, voice: str, rate: str, pitch: str, volume: str, out_path: Path, force: bool = False):
     import edge_tts
     out_path.parent.mkdir(parents=True, exist_ok=True)
     
-    if out_path.exists() and out_path.stat().st_size > 500:
+    # If a valid cached audio file exists and force is False, reuse it
+    if not force and out_path.exists() and out_path.stat().st_size > 500:
         return
 
-    for attempt in range(4):
+    # Delete 0-byte, corrupted, or stale file if present
+    if out_path.exists():
         try:
+            out_path.unlink()
+        except Exception:
+            pass
+
+    clean_text = clean_tts_text(text)
+    # If text is empty or has no word/syllable characters, create silent audio fallback
+    if not clean_text or not any(c.isalnum() for c in clean_text):
+        cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "0.5", "-b:a", "128k", str(out_path)]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return
+
+    is_female = "Sreymom" in voice or "Female" in voice
+    fallback_voice = "km-KH-SreymomNeural" if is_female else "km-KH-PisethNeural"
+
+    # Multi-attempt retry loop with exponential backoff and progressive simplification
+    for attempt in range(5):
+        try:
+            if out_path.exists():
+                try:
+                    out_path.unlink()
+                except Exception:
+                    pass
+
             if attempt == 0:
-                c = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch=pitch, volume=volume)
+                c = edge_tts.Communicate(text=clean_text, voice=voice, rate=rate, pitch=pitch, volume=volume)
             elif attempt == 1:
-                c = edge_tts.Communicate(text=text, voice=voice, rate=rate, pitch="+0Hz", volume=volume)
+                await asyncio.sleep(1.0)
+                # Attempt 1: reset pitch to 0Hz
+                c = edge_tts.Communicate(text=clean_text, voice=voice, rate=rate, pitch="+0Hz", volume=volume)
+            elif attempt == 2:
+                await asyncio.sleep(2.0)
+                # Attempt 2: reset both rate and pitch to baseline
+                c = edge_tts.Communicate(text=clean_text, voice=voice)
+            elif attempt == 3:
+                await asyncio.sleep(3.0)
+                # Attempt 3: switch to fallback voice
+                c = edge_tts.Communicate(text=clean_text, voice=fallback_voice)
             else:
-                c = edge_tts.Communicate(text=text, voice=voice)
+                await asyncio.sleep(4.0)
+                # Attempt 4: canonical standard male voice
+                c = edge_tts.Communicate(text=clean_text, voice="km-KH-PisethNeural")
+
             await c.save(str(out_path))
+
             if out_path.exists() and out_path.stat().st_size > 500:
                 return
-        except Exception:
-            if attempt == 3:
-                raise
-            await asyncio.sleep(0.5 * (attempt + 1))
+        except Exception as e:
+            logger.warning(f"TTS attempt {attempt + 1} error for line '{clean_text[:25]}...': {e}")
+            if out_path.exists():
+                try:
+                    out_path.unlink()
+                except Exception:
+                    pass
+            if attempt == 4:
+                # Guaranteed fallback: generate silent MP3 so pipeline never throws 500
+                logger.error(f"All TTS attempts exhausted for '{clean_text[:30]}'. Generating clean silent fallback audio.")
+                cmd = ["ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "1.0", "-b:a", "128k", str(out_path)]
+                subprocess.run(cmd, check=True, capture_output=True)
+                return
 
 def process_single_line_audio(raw_mp3: Path, adj_wav: Path, target_dur: float, max_allowed: float) -> float:
     """
     Applies highpass, clarity EQ, and precise atempo stretch so dialogue fits the scene slot.
     """
     raw_dur = get_duration(raw_mp3)
+    if raw_dur <= 0.05:
+        # Fallback for silent / near-zero audio
+        silence_dur = max(0.2, min(target_dur, 2.0))
+        cmd = [
+            "ffmpeg", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo",
+            "-t", f"{silence_dur:.3f}",
+            "-ar", "44100", "-ac", "2",
+            str(adj_wav)
+        ]
+        subprocess.run(cmd, check=True, capture_output=True)
+        return silence_dur
+
     speed_factor = 1.0
 
     if raw_dur > max_allowed:
@@ -540,6 +621,9 @@ async def synthesize_dialogue_timeline(
 
         await safe_communicate_tts(km_text, voice, rate, pitch, volume, raw_path)
         final_dur = process_single_line_audio(raw_path, adj_path, target_dur, max_allowed)
+
+        # Pacing delay between consecutive requests to avoid server-side rate limits
+        await asyncio.sleep(0.15)
 
         if progress_cb:
             pct = (i + 1) / total
